@@ -1,0 +1,80 @@
+---
+# Runs on the hook runner (localhost inside the pod)
+- name: Prepare environment and register Windows VM
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - plan.yml
+    - workload.yml
+
+  tasks:
+    # 1️⃣ Load VM credentials from the Kubernetes secret
+    - name: Get Windows VM credentials from secret
+      k8s_info:
+        api_version: v1
+        kind: Secret
+        name: windows-cred-ra
+        #name: broadcast-svc-ansible
+        namespace: openshift-mtv
+      register: win_secret
+
+    # 2️⃣ Decode the credentials
+    - name: Decode credentials
+      set_fact:
+        win_user: "{{ win_secret.resources[0].data.username | b64decode }}"
+        win_pass: "{{ win_secret.resources[0].data.password | b64decode }}"
+    - name: Load Plan
+      include_vars:
+        file: plan.yml
+        name: plan
+    - name: Load Workload
+      include_vars:
+        file: workload.yml
+        name: workload
+
+    # 4️⃣ Add the migrated VM dynamically as a target
+    - name: Add migrated Windows VM host
+      add_host:
+        name: "{{ workload.vm.ipaddress }}"      # MTV provides vm.ipaddress via workload.yml
+        ansible_user: "{{ win_user }}"
+        ansible_password: "{{ win_pass }}"
+        ansible_connection: winrm
+        ansible_winrm_transport: ntlm
+        ansible_port: 5985
+        ansible_winrm_server_cert_validation: ignore
+        groups: windows_vms
+
+- name: Pre-migration cleanup and configuration
+  hosts: windows_vms
+  collections:
+    - ansible.windows
+  gather_facts: yes
+
+
+  tasks:
+    - name: Get VMware Horizon Agent GUID
+      ansible.windows.win_shell: |
+        Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                      "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall" |
+        ForEach-Object {
+          $p = Get-ItemProperty $_.PSPath
+          if ($p.DisplayName -like "*Horizon Agent*") { $p.PSChildName }
+        }
+      register: horizon_guid
+
+    - name: Show detected GUID
+      ansible.builtin.debug:
+        var: horizon_guid.stdout_lines
+
+    - name: Uninstall VMware Horizon Agent (if found)
+      ansible.windows.win_package:
+        product_id: "{{ horizon_guid.stdout | trim }}"
+        state: absent
+      register: horizon_uninstall
+      when: horizon_guid.stdout | regex_search('{[0-9A-Fa-f\-]+}')
+      # ignore_errors: yes
+      # when: ansible_os_family == "Windows"
+
+    - name: Report Horizon Agent uninstall result
+      ansible.builtin.debug:
+        var: horizon_uninstall.changed
