@@ -1,0 +1,88 @@
+---
+# Runs on the hook runner (localhost inside the pod)
+- name: Prepare environment and register Windows VM
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - plan.yml
+    - workload.yml
+
+  tasks:
+    # 1️⃣ Load VM credentials from the Kubernetes secret
+    - name: Get Windows VM credentials from secret
+      k8s_info:
+        api_version: v1
+        kind: Secret
+        name: windows-cred-ra
+        # name: broadcast-svc-ansible
+        namespace: openshift-mtv
+      register: win_secret
+
+    # 2️⃣ Decode the credentials
+    - name: Decode credentials
+      set_fact:
+        win_user: "{{ win_secret.resources[0].data.username | b64decode }}"
+        win_pass: "{{ win_secret.resources[0].data.password | b64decode }}"
+
+
+    - name: Load Plan
+      include_vars:
+        file: plan.yml
+        name: plan
+    - name: Load Workload
+      include_vars:
+        file: workload.yml
+        name: workload
+
+    # 4️⃣ Add the migrated VM dynamically as a target
+    - name: Add migrated Windows VM host
+      add_host:
+        name: "{{ workload.vm.ipaddress }}"      # MTV provides vm.ipaddress via workload.yml
+        ansible_user: "{{ win_user }}"
+        ansible_password: "{{ win_pass }}"
+        ansible_connection: winrm
+        ansible_winrm_transport: ntlm
+        ansible_port: 5985
+        ansible_winrm_server_cert_validation: ignore
+        groups: windows_vms
+
+- name: Post-migration cleanup and configuration
+  hosts: windows_vms
+  collections:
+    - ansible.windows
+  gather_facts: no
+
+  tasks:
+    - name: Wait for VM to settle before running hook
+      pause:
+        seconds: 900
+    - name: Stop VMware VGAuthService
+      ansible.windows.win_service:
+        name: VGAuthService
+        state: stopped
+        # force_dependent_services: true
+      ignore_errors: yes
+    - name: Stop VMware VGAuthService helper
+      ansible.windows.win_service:
+        name: vm3dService
+        state: stopped
+        # force_dependent_services: true
+      ignore_errors: yes
+    - name: Stop VMware Tools service
+      ansible.windows.win_service:
+        name: VMTools
+        state: stopped
+        force_dependent_services: true
+      ignore_errors: yes
+    - name: Execute Remove VMWare Tools script
+      ansible.windows.win_powershell:
+        path: "C:\\IT\\remove_vmtools_automation.ps1"
+        remote_src: true
+      ignore_errors: yes  
+    - name: Reboot the machine and wait for it to come back
+      ansible.windows.win_reboot:
+        msg: "Reboot initiated by Ansible for maintenance"
+        reboot_timeout: 900
+        post_reboot_delay: 30
+        pre_reboot_delay: 15
+
